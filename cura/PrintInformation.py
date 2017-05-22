@@ -5,11 +5,12 @@ from PyQt5.QtCore import QObject, pyqtSignal, pyqtProperty
 from UM.FlameProfiler import pyqtSlot
 
 from UM.Application import Application
+from UM.Logger import Logger
 from UM.Qt.Duration import Duration
 from UM.Preferences import Preferences
-from UM.Settings import ContainerRegistry
+from UM.Settings.ContainerRegistry import ContainerRegistry
 
-import cura.Settings.ExtruderManager
+from cura.Settings.ExtruderManager import ExtruderManager
 
 import math
 import os.path
@@ -30,8 +31,8 @@ catalog = i18nCatalog("cura")
 #   - This triggers a new slice with the current settings - this is the "current settings pass".
 #   - When the slice is done, we update the current print time and material amount.
 #   - If the source of the slice was not a Setting change, we start the second slice pass, the "low quality settings pass". Otherwise we stop here.
-#   - When that is done, we update the minimum print time and start the final slice pass, the "high quality settings pass".
-#   - When the high quality pass is done, we update the maximum print time.
+#   - When that is done, we update the minimum print time and start the final slice pass, the "Extra Fine settings pass".
+#   - When the Extra Fine pass is done, we update the maximum print time.
 #
 #   This class also mangles the current machine name and the filename of the first loaded mesh into a job name.
 #   This job name is requested by the JobSpecs qml file.
@@ -51,6 +52,19 @@ class PrintInformation(QObject):
         super().__init__(parent)
 
         self._current_print_time = Duration(None, self)
+        self._print_times_per_feature = {
+            "none": Duration(None, self),
+            "inset_0": Duration(None, self),
+            "inset_x": Duration(None, self),
+            "skin": Duration(None, self),
+            "support": Duration(None, self),
+            "skirt": Duration(None, self),
+            "infill": Duration(None, self),
+            "support_infill": Duration(None, self),
+            "travel": Duration(None, self),
+            "retract": Duration(None, self),
+            "support_interface": Duration(None, self)
+        }
 
         self._material_lengths = []
         self._material_weights = []
@@ -74,6 +88,8 @@ class PrintInformation(QObject):
         Application.getInstance().getMachineManager().activeMaterialChanged.connect(self._onActiveMaterialChanged)
         self._onActiveMaterialChanged()
 
+        self._material_amounts = []
+
     currentPrintTimeChanged = pyqtSignal()
 
     preSlicedChanged = pyqtSignal()
@@ -89,6 +105,10 @@ class PrintInformation(QObject):
     @pyqtProperty(Duration, notify = currentPrintTimeChanged)
     def currentPrintTime(self):
         return self._current_print_time
+
+    @pyqtProperty("QVariantMap", notify = currentPrintTimeChanged)
+    def printTimesPerFeature(self):
+        return self._print_times_per_feature
 
     materialLengthsChanged = pyqtSignal()
 
@@ -108,23 +128,35 @@ class PrintInformation(QObject):
     def materialCosts(self):
         return self._material_costs
 
-    def _onPrintDurationMessage(self, total_time, material_amounts):
+    def _onPrintDurationMessage(self, time_per_feature, material_amounts):
+        total_time = 0
+        for feature, time in time_per_feature.items():
+            if time != time:  # Check for NaN. Engine can sometimes give us weird values.
+                self._print_times_per_feature[feature].setDuration(0)
+                Logger.log("w", "Received NaN for print duration message")
+                continue
+            total_time += time
+            self._print_times_per_feature[feature].setDuration(time)
         self._current_print_time.setDuration(total_time)
+
         self.currentPrintTimeChanged.emit()
 
         self._material_amounts = material_amounts
         self._calculateInformation()
 
     def _calculateInformation(self):
+        if Application.getInstance().getGlobalContainerStack() is None:
+            return
+
         # Material amount is sent as an amount of mm^3, so calculate length from that
-        r = Application.getInstance().getGlobalContainerStack().getProperty("material_diameter", "value") / 2
+        radius = Application.getInstance().getGlobalContainerStack().getProperty("material_diameter", "value") / 2
         self._material_lengths = []
         self._material_weights = []
         self._material_costs = []
 
         material_preference_values = json.loads(Preferences.getInstance().getValue("cura/material_settings"))
 
-        extruder_stacks = list(cura.Settings.ExtruderManager.getInstance().getMachineExtruders(Application.getInstance().getGlobalContainerStack().getId()))
+        extruder_stacks = list(ExtruderManager.getInstance().getMachineExtruders(Application.getInstance().getGlobalContainerStack().getId()))
         for index, amount in enumerate(self._material_amounts):
             ## Find the right extruder stack. As the list isn't sorted because it's a annoying generator, we do some
             #  list comprehension filtering to solve this for us.
@@ -152,8 +184,12 @@ class PrintInformation(QObject):
                     else:
                         cost = 0
 
+            if radius != 0:
+                length = round((amount / (math.pi * radius ** 2)) / 1000, 2)
+            else:
+                length = 0
             self._material_weights.append(weight)
-            self._material_lengths.append(round((amount / (math.pi * r ** 2)) / 1000, 2))
+            self._material_lengths.append(length)
             self._material_costs.append(cost)
 
         self.materialLengthsChanged.emit()
@@ -168,7 +204,10 @@ class PrintInformation(QObject):
 
     def _onActiveMaterialChanged(self):
         if self._active_material_container:
-            self._active_material_container.metaDataChanged.disconnect(self._onMaterialMetaDataChanged)
+            try:
+                self._active_material_container.metaDataChanged.disconnect(self._onMaterialMetaDataChanged)
+            except TypeError: #pyQtSignal gives a TypeError when disconnecting from something that is already disconnected.
+                pass
 
         active_material_id = Application.getInstance().getMachineManager().activeMaterialId
         active_material_containers = ContainerRegistry.getInstance().findInstanceContainers(id=active_material_id)
@@ -177,7 +216,7 @@ class PrintInformation(QObject):
             self._active_material_container = active_material_containers[0]
             self._active_material_container.metaDataChanged.connect(self._onMaterialMetaDataChanged)
 
-    def _onMaterialMetaDataChanged(self):
+    def _onMaterialMetaDataChanged(self, *args, **kwargs):
         self._calculateInformation()
 
     @pyqtSlot(str)
@@ -200,11 +239,16 @@ class PrintInformation(QObject):
 
     @pyqtSlot(str, result = str)
     def createJobName(self, base_name):
+        if base_name == "":
+            return ""
         base_name = self._stripAccents(base_name)
         self._setAbbreviatedMachineName()
         if self._pre_sliced:
             return catalog.i18nc("@label", "Pre-sliced file {0}", base_name)
         elif Preferences.getInstance().getValue("cura/jobname_prefix"):
+            # Don't add abbreviation if it already has the exact same abbreviation.
+            if base_name.startswith(self._abbr_machine + "_"):
+                return base_name
             return self._abbr_machine + "_" + base_name
         else:
             return base_name
